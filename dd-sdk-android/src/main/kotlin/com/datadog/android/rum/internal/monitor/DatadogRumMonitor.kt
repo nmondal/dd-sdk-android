@@ -19,6 +19,9 @@ import com.datadog.android.rum.internal.domain.RumEventData
 import com.datadog.android.rum.internal.domain.RumEventSerializer
 import java.lang.ref.WeakReference
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 
 internal class DatadogRumMonitor(
     private val writer: Writer<RumEvent>,
@@ -39,24 +42,17 @@ internal class DatadogRumMonitor(
 
     private val activeResources = mutableMapOf<WeakReference<Any>, RumEvent>()
 
-    // region RumMonitor
+    @Volatile
+    private var activeActionEvent: RumEvent? = null
 
-    @Synchronized
-    override fun addUserAction(
-        action: String,
-        attributes: Map<String, Any?>
-    ) {
-        GlobalRum.addUserInteraction()
-        val eventData = RumEventData.UserAction(action, UUID.randomUUID(), 0L)
-        val event = RumEvent(
-            GlobalRum.getRumContext(),
-            timeProvider.getDeviceTimestamp(),
-            eventData,
-            attributes
-        )
-        writer.write(event)
-        updateAndSendView { it.incrementUserActionCount() }
-    }
+    @Volatile
+    private var activeActionData: RumEventData.UserAction? = null
+
+    private var ongoingUserActionResources = mutableListOf<WeakReference<Any>>()
+
+    private val lastActionRelatedEventNs = AtomicLong(0L)
+
+    // region RumMonitor
 
     @Synchronized
     override fun startView(
@@ -93,6 +89,7 @@ internal class DatadogRumMonitor(
         attributes: Map<String, Any?>
     ) {
         sendUnclosedResources()
+        sendUnclosedAction()
 
         val startedKey = activeViewKey.get()
         val startedEvent = activeViewEvent
@@ -127,11 +124,34 @@ internal class DatadogRumMonitor(
     }
 
     @Synchronized
+    override fun addUserAction(
+        action: String,
+        attributes: Map<String, Any?>
+    ) {
+        val nanoTime = System.nanoTime()
+        val eventData = RumEventData.UserAction(
+            action,
+            UUID.randomUUID(),
+            nanoTime
+        )
+        val event = RumEvent(
+            GlobalRum.getRumContext(),
+            timeProvider.getDeviceTimestamp(),
+            eventData,
+            attributes
+        )
+        lastActionRelatedEventNs.set(nanoTime)
+        activeActionEvent = event
+        activeActionData = eventData
+    }
+
+    @Synchronized
     override fun startResource(
         key: Any,
         url: String,
         attributes: Map<String, Any?>
     ) {
+        val updatedAttributes = updateAttributesWithActionId(attributes)
         val eventData = RumEventData.Resource(
             RumResourceKind.OTHER,
             url,
@@ -141,9 +161,10 @@ internal class DatadogRumMonitor(
             GlobalRum.getRumContext(),
             timeProvider.getDeviceTimestamp(),
             eventData,
-            attributes
+            updatedAttributes
         )
         activeResources[WeakReference(key)] = event
+        ongoingUserActionResources.add(WeakReference(key))
     }
 
     @Synchronized
@@ -152,6 +173,7 @@ internal class DatadogRumMonitor(
         kind: RumResourceKind,
         attributes: Map<String, Any?>
     ) {
+        updateUserActionResources(key)
         val keyRef = activeResources.keys.firstOrNull { it.get() == key }
         val startedEvent = if (keyRef == null) null else activeResources.remove(keyRef)
         val startedEventData = startedEvent?.eventData as? RumEventData.Resource
@@ -167,6 +189,7 @@ internal class DatadogRumMonitor(
         origin: String,
         throwable: Throwable
     ) {
+        updateUserActionResources(key)
         val keyRef = activeResources.keys.firstOrNull { it.get() == key }
         val startedEvent = if (keyRef == null) null else activeResources.remove(keyRef)
         val startedEventData = startedEvent?.eventData as? RumEventData.Resource
@@ -200,12 +223,13 @@ internal class DatadogRumMonitor(
         throwable: Throwable,
         attributes: Map<String, Any?>
     ) {
+        val updatedAttributes = updateAttributesWithActionId(attributes)
         val eventData = RumEventData.Error(message, origin, throwable)
         val event = RumEvent(
             GlobalRum.getRumContext(),
             timeProvider.getDeviceTimestamp(),
             eventData,
-            attributes
+            updatedAttributes
         )
         writer.write(event)
         updateAndSendView { it.incrementErrorCount() }
@@ -214,6 +238,70 @@ internal class DatadogRumMonitor(
     // endregion
 
     // region Internal
+
+    private fun updateAttributesWithActionId(
+        attributes: Map<String, Any?>
+    ): Map<String, Any?> {
+        val actionId = getActiveActionId()
+        return if (actionId == null) {
+            attributes
+        } else {
+            attributes.toMutableMap()
+                .apply {
+                    put(RumEventSerializer.TAG_EVENT_USER_ACTION_ID, actionId.toString())
+                }
+        }
+    }
+
+    private fun getActiveActionId(): UUID? {
+        val nanoTime = System.nanoTime()
+        val lastAction = lastActionRelatedEventNs.get()
+        val actionEvent = activeActionEvent
+        val actionData = activeActionData
+        val isLastEventRecent = (nanoTime - lastAction) < ACTION_INACTIVITY_NS
+        ongoingUserActionResources.removeAll { it.get() == null }
+        val hasUnclosedResources = ongoingUserActionResources.isNotEmpty()
+        val isWithinActionScope = isLastEventRecent || hasUnclosedResources
+
+        return if (
+            actionEvent != null &&
+            actionData != null &&
+            isWithinActionScope
+        ) {
+            lastActionRelatedEventNs.set(nanoTime)
+            actionData.id
+        } else {
+            sendUserAction(actionEvent, actionData, lastAction)
+            activeActionEvent = null
+            activeActionData = null
+            null
+        }
+    }
+
+    private fun sendUnclosedAction() {
+        val lastAction = lastActionRelatedEventNs.get()
+        val actionEvent = activeActionEvent
+        val actionData = activeActionData
+        sendUserAction(actionEvent, actionData, lastAction)
+        activeActionEvent = null
+        activeActionData = null
+    }
+
+    private fun updateUserActionResources(key: Any) {
+        val nanoTime = System.nanoTime()
+        val actionEvent = activeActionEvent
+        val actionData = activeActionData
+
+        if (actionEvent != null && actionData != null) {
+            val keyRef = ongoingUserActionResources.firstOrNull { it.get() == key }
+            if (keyRef != null) {
+                ongoingUserActionResources.remove(keyRef)
+                lastActionRelatedEventNs.set(nanoTime)
+            }
+        }
+
+        ongoingUserActionResources.removeAll { it.get() == null }
+    }
 
     private fun updateAndSendView(
         attributes: Map<String, Any?> = emptyMap(),
@@ -301,5 +389,42 @@ internal class DatadogRumMonitor(
             }
     }
 
+    private fun sendUserAction(
+        startedEvent: RumEvent?,
+        startedEventData: RumEventData.UserAction?,
+        endNanoTime: Long
+    ) {
+        when {
+            startedEvent == null -> devLogger.w(
+                "Unable to end user action. " +
+                    "This can mean that the action was not started or already ended."
+            )
+            startedEventData == null -> devLogger.e(
+                "Unable to end user action. The related data was inconsistent."
+            )
+            else -> sendCompleteUserAction(startedEvent, startedEventData, endNanoTime)
+        }
+    }
+
+    private fun sendCompleteUserAction(
+        startedEvent: RumEvent,
+        startedEventData: RumEventData.UserAction,
+        endNanoTime: Long
+    ) {
+        val updatedDurationNs = endNanoTime - startedEventData.durationNanoSeconds
+        val updatedEvent = startedEvent.copy(
+            eventData = startedEventData.copy(
+                durationNanoSeconds = max(updatedDurationNs, 1L)
+            )
+        )
+        writer.write(updatedEvent)
+        updateAndSendView { it.incrementUserActionCount() }
+    }
+
     // endregion
+
+    companion object {
+        internal const val ACTION_INACTIVITY_MS = 100L
+        internal val ACTION_INACTIVITY_NS = TimeUnit.MILLISECONDS.toNanos(ACTION_INACTIVITY_MS)
+    }
 }
